@@ -343,6 +343,7 @@ MIT — voir [`LICENSE`](LICENSE).
 **[Fouad MOUTAIROU]**
 - Portfolio : https://portfolio-fouad.netlify.app/
 - LinkedIn : https://www.linkedin.com/in/fouad-moutairou-044460273/
+- Github : https://github.com/Fouad-berry
 
 ---
 
