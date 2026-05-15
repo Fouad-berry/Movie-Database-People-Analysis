@@ -1,83 +1,69 @@
-# 🎓 Concepts dbt utilisés dans ce projet
+# 🔬 Méthodologie
 
-Ce document explique les concepts dbt employés, pour servir de référence et démontrer la compréhension lors d'entretiens.
+## 1. Choix de la stack
 
-## 1. Architecture en 3 couches (medallion)
+**Pourquoi dbt + DuckDB plutôt qu'autre chose ?**
 
-| Couche | Convention de nommage | Matérialisation | Rôle |
-|--------|----------------------|-----------------|------|
-| **staging** (`stg_*`) | 1 modèle = 1 source | view | Nettoyage atomique : trim, cast, mapping codes |
-| **intermediate** (`int_*`) | Réutilisable, jamais consommé direct | view | Jointures, features dérivées, logique commune |
-| **marts** (`fct_*` / `dim_*` / `mart_*`) | Consommé par BI/dashboards | table | Tables finales, optimisées pour requêtes |
+| Critère | dbt + DuckDB | dbt + BigQuery/Snowflake | Pandas pur |
+|---------|--------------|--------------------------|------------|
+| Coût | **Gratuit** | ~$X/mois | Gratuit |
+| Reproductibilité | **Excellente** (tout en local) | Bonne | Moyenne (pas de schéma) |
+| Vitesse | < 5s pour ce dataset | < 5s | 30s+ (load CSV) |
+| Compétence recherchée | **Top demande 2024-2025** | Top demande | Basique |
+| Tests automatiques | **Oui** | Oui | Non (manuels) |
 
-C'est la convention dbt Labs officielle, suivie par 90 % des équipes data.
+DuckDB est devenu la norme pour les projets locaux : OLAP, parquet natif, SQL ANSI, ~1ms par requête.
 
-## 2. Sources
+## 2. Modèle d'architecture (medallion light)
 
-Déclarées dans `models/staging/_sources.yml` :
-
-```yaml
-sources:
-  - name: raw
-    schema: raw
-    tables:
-      - name: popular_people
-        freshness: { warn_after: { count: 7, period: day } }
+```
+Bronze  →  Silver       →  Gold        ←  équivalent Databricks
+RAW     →  STAGING + INT →  MARTS       ←  notre convention dbt
 ```
 
-Pourquoi ? On ne référence jamais directement `raw.popular_people` dans le SQL. À la place :
+- **RAW** : copie 1:1 du CSV, aucune transformation. Permet de toujours revenir à la source.
+- **STAGING** : nettoyage atomique, typage strict. **Une seule personne en charge** (data engineer).
+- **INTERMEDIATE** : enrichissement, features dérivées. Pas consommé directement par la BI.
+- **MARTS** : tables business prêtes à brancher. Consommées par data analysts, dashboards, ML.
 
-```sql
-select * from {{ source('raw', 'popular_people') }}
-```
+**Règle d'or** : un consommateur (analyste, dashboard) lit UNIQUEMENT les marts. Jamais staging ou raw.
 
-→ dbt sait que ce modèle dépend d'une source externe et peut tester sa fraîcheur.
+## 3. Conventions de nommage
 
-## 3. ref()
+Suivies dans tout le projet :
 
-À l'intérieur de dbt, on n'écrit JAMAIS le nom de table en dur :
+| Préfixe | Usage |
+|---------|-------|
+| `stg_` | Modèle staging |
+| `int_` | Modèle intermediate |
+| `fct_` | Table de faits (1 ligne = 1 événement/entité) |
+| `dim_` | Table de dimension (1 ligne = 1 entité descriptive) |
+| `mart_` | Table dérivée, agrégée, pour cas d'usage spécifique |
 
-```sql
--- ❌ MAUVAIS
-select * from main_staging.stg_popular_people
+## 4. Qualité des données
 
--- ✅ BON
-select * from {{ ref('stg_popular_people') }}
-```
+**4 niveaux de tests** :
 
-Bénéfices :
-- **Lineage automatique** : dbt sait quel modèle dépend de quel autre
-- **Portabilité** : marche peu importe le schéma cible (dev/prod)
-- **Ordre d'exécution** : dbt résout automatiquement le DAG
+1. **Sources** : tests sur les données brutes avant transformation
+   - `not_null` sur les colonnes critiques
+   - `accepted_values` pour les enum
+   - `freshness` pour détecter les retards d'ingestion
 
-## 4. Tests dbt
+2. **Modèles** : tests à chaque étape de transformation
+   - `unique` sur les clés
+   - `accepted_values` sur les nouvelles catégorisations
 
-Deux types de tests :
+3. **Tests métier custom** : règles business spécifiques
+   - "Le rang d'une personne dans son département ne peut pas dépasser la taille du département"
 
-### Tests génériques (déclaratifs en YAML)
+4. **Test invariant** : règle constante du dataset
+   - "Le total doit être 9 980 personnes"
 
-```yaml
-columns:
-  - name: person_sk
-    data_tests: [unique, not_null]
-  - name: gender
-    data_tests:
-      - accepted_values:
-          values: ['female', 'male', 'non_binary', 'not_specified']
-```
+→ Si **un seul test échoue**, le pipeline doit s'arrêter (en CI/CD).
 
-### Tests singuliers (SQL custom dans `tests/`)
+## 5. Variables et paramètres
 
-```sql
--- Si cette query retourne ≥ 1 ligne, le test ÉCHOUE
-select *
-from {{ ref('int_people_enriched') }}
-where popularity_rank_in_department > department_size
-```
-
-## 5. Variables (vars)
-
-Définies dans `dbt_project.yml` :
+Toute valeur "business" qui pourrait changer est en `vars` dans `dbt_project.yml` :
 
 ```yaml
 vars:
@@ -85,90 +71,44 @@ vars:
   medium_popularity_threshold: 3.0
 ```
 
-Utilisées dans les modèles via `{{ var('high_popularity_threshold') }}`.
+Avantages :
+- Une seule source de vérité (DRY)
+- Audit-friendly (un commit Git change le seuil)
+- Permet du staging dev vs prod facilement
 
-→ Permet de **changer la business logic sans toucher au SQL** (utile en revue de code, A/B testing, etc.).
+## 6. Idempotence
 
-## 6. Macros (Jinja réutilisable)
+Chaque exécution doit produire le même résultat. Pas de `INSERT INTO` dans dbt, uniquement des `CREATE TABLE AS SELECT` ou `CREATE VIEW`.
 
-Macros = fonctions SQL :
+→ `make all` peut être lancé 100 fois, le résultat sera identique. Critère essentiel en data engineering.
 
-```sql
-{% macro categorize_score(column, high, medium) %}
-    case
-        when {{ column }} >= {{ high }} then 'high'
-        when {{ column }} >= {{ medium }} then 'medium'
-        else 'low'
-    end
-{% endmacro %}
-```
+## 7. Limitations actuelles
 
-Appel : `{{ categorize_score('popularity_score', 10.0, 3.0) }}`.
+- **Pas de SCD** (Slowly Changing Dimensions) : le dataset est statique, on ne suit pas l'évolution dans le temps
+- **Pas d'incremental** : on recompute tout à chaque run (acceptable pour 9 980 lignes, problématique pour 1M+)
+- **Pas de CI/CD** : actuellement on lance manuellement `make all`
+- **DuckDB local** : pas adapté à un usage multi-utilisateurs concurrent
 
-## 7. Materializations
+## 8. Pistes d'évolution
 
-| Type | Quand l'utiliser | Coût |
-|------|------------------|------|
-| `view` | Modèle léger, rarement requêté | Aucun (juste un alias SQL) |
-| `table` | Modèle souvent requêté en BI | Stockage + recalcul à chaque run |
-| `incremental` | Données volumineuses, append-only | Optimal sur gros volumes |
-| `ephemeral` | Modèle utilisé une seule fois | Inliné comme CTE |
+### À court terme (1-2 jours)
+- Ajouter des snapshots dbt pour tracker l'évolution
+- Mettre en place GitHub Actions pour CI/CD
+- Ajouter `dbt-elementary` pour des alertes de qualité
 
-Dans ce projet : staging/intermediate = `view`, marts = `table` (pour performance Looker).
+### À moyen terme (1 semaine)
+- Migrer le target vers BigQuery (déjà préparé dans `profiles.yml`)
+- Brancher Looker Studio sur BigQuery directement
+- Mettre en place une orchestration Airflow / Prefect
 
-## 8. Schemas (séparation logique)
+### À long terme (1+ mois)
+- Architecture Kafka → DuckDB pour streaming
+- ML feature store basé sur les marts
+- Self-service analytics via Lightdash ou Metabase
 
-Dans `dbt_project.yml` :
+## 9. Ressources
 
-```yaml
-models:
-  tmdb_people:
-    staging: { +schema: staging }
-    intermediate: { +schema: intermediate }
-    marts: { +schema: marts }
-```
-
-→ Crée automatiquement `main_staging`, `main_intermediate`, `main_marts` dans DuckDB. Indispensable pour organiser un warehouse réel.
-
-## 9. dbt docs
-
-```bash
-dbt docs generate
-dbt docs serve
-```
-
-→ Génère un site web interactif avec :
-- **Graphe de dépendances** (DAG cliquable)
-- **Schéma de chaque table** avec descriptions
-- **Liste des tests** par modèle
-- **Code source** SQL/YAML
-
-C'est LA différence entre "j'ai écrit du SQL" et "j'ai produit un projet data professionnel".
-
-## 10. Commandes utiles
-
-```bash
-# Exécuter un seul modèle
-dbt run --select stg_popular_people
-
-# Exécuter un modèle + tous ses descendants
-dbt run --select stg_popular_people+
-
-# Exécuter un modèle + tous ses ancêtres
-dbt run --select +mart_global_kpis
-
-# Tester un seul modèle
-dbt test --select fct_people
-
-# Tester seulement les sources
-dbt test --select source:raw
-
-# Compiler sans exécuter (vérifier la syntaxe)
-dbt compile
-
-# Voir le SQL généré
-cat target/compiled/tmdb_people/models/staging/stg_popular_people.sql
-
-# Voir le DAG en ASCII
-dbt list --output graph
-```
+- [dbt documentation officielle](https://docs.getdbt.com/)
+- [DuckDB documentation](https://duckdb.org/docs/)
+- [dbt Labs YouTube channel](https://www.youtube.com/@dbtLabs) — excellents tutos
+- [Data engineering zoomcamp](https://github.com/DataTalksClub/data-engineering-zoomcamp) — cours gratuit complet
