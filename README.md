@@ -341,7 +341,7 @@ MIT — voir [`LICENSE`](LICENSE).
 ## 👤 Auteur
 
 **[Fouad MOUTAIROU]**
-- My Portfolio : https://portfolio-fouad.netlify.app/
+- Portfolio : https://portfolio-fouad.netlify.app/
 - LinkedIn : https://www.linkedin.com/in/fouad-moutairou-044460273/
 - Github : https://github.com/Fouad-berry
 
